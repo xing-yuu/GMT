@@ -1,14 +1,14 @@
-mode: Train
 pre_train: null
 device: gpu
 
-train_data_path:  ['data/Train/PSL','data/Train/Truss','data/Train/PSL']
-vail_data_path:   ['data/Vail/PSL', 'data/Vail/Truss', 'data/Vail/TPMS']
+train_data_path:  ['data/Train/PSL','data/Train/Truss','data/Train/TPMS']
+val_data_path:    ['data/Vail/PSL', 'data/Vail/Truss', 'data/Vail/TPMS']
 
 
 batch_size: 3
-num_works: 3
 learning_rate: 4e-4
+warmup_steps: 500
+gradient_clip_norm: 1.0
 max_epoch: 120
 
 output_path: ./result

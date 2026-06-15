@@ -2,103 +2,79 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
 
-def get_node_type(voxel: torch.Tensor) -> torch.Tensor:
-    r = voxel.shape[0]
-    node_type = torch.zeros((r, r, r, 8), dtype=torch.uint8, device=voxel.device)
-    hex8 = torch.tensor(
-        [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]],
-        dtype=torch.int64,
-        device=voxel.device
-    )
-    solid_voxel_coo = torch.nonzero(voxel, as_tuple=False)
-    for i in range(8):
-        coo = (solid_voxel_coo + hex8[i] + r) % r
-        node_type[coo[:, 0], coo[:, 1], coo[:, 2], i] = 1
+HEX8 = np.array(
+    [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+     [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+    dtype=np.int32,
+)
+
+
+def get_node_type(voxel: np.ndarray) -> np.ndarray:
+    res = voxel.shape[0]
+    node_type = np.zeros((res, res, res, 8), dtype=np.uint8)
+    solid = np.argwhere(voxel)
+    for corner, offset in enumerate(HEX8):
+        coord = (solid + offset) % res
+        node_type[coord[:, 0], coord[:, 1], coord[:, 2], corner] = 1
     return node_type
 
 
 def load_voxel_from_file(path: Path, res: int) -> np.ndarray:
-    suf = path.suffix.lower()
-    if suf == ".npy":
-        arr = np.load(path)
-    elif suf == ".csv":
-        arr = np.loadtxt(path, delimiter=",")
-    elif suf == ".npz":
-        arr = np.load(path)["voxel"]
+    if path.suffix.lower() == ".npy":
+        array = np.load(path)
+    elif path.suffix.lower() == ".csv":
+        array = np.loadtxt(path, delimiter=",")
+    elif path.suffix.lower() == ".npz":
+        array = np.load(path)["voxel"]
     else:
         raise ValueError(f"Unsupported file type: {path}")
-
-    arr = np.asarray(arr)
-    if arr.shape != (res, res, res):
-        arr = arr.reshape(res, res, res)
-
-    return (arr > 0)  # bool
+    return (np.asarray(array).reshape(res, res, res) > 0)
 
 
-@torch.no_grad()
-def process_one_voxel(voxel_np: np.ndarray, res: int, device: torch.device):
-    voxel = torch.from_numpy(voxel_np.astype(np.uint8)).to(device).reshape(res, res, res)
-    voxel_coo = torch.nonzero(voxel, as_tuple=False)  # (Nv,3)
-
-    node_full_grid = voxel.clone()
-    for i in (0, 1):
-        for j in (0, 1):
-            for k in (0, 1):
-                coo = (voxel_coo + torch.tensor([i, j, k], device=device) + res) % res
-                node_full_grid[coo[:, 0], coo[:, 1], coo[:, 2]] = 1
-    all_node_coo = torch.nonzero(node_full_grid, as_tuple=False)  # (Nn,3)
+def process_one_voxel(voxel: np.ndarray, res: int):
+    voxel = voxel.reshape(res, res, res).astype(bool, copy=False)
+    voxel_coord = np.argwhere(voxel).astype(np.int32)
+    node_grid = np.zeros_like(voxel)
+    for offset in HEX8:
+        coord = (voxel_coord + offset) % res
+        node_grid[coord[:, 0], coord[:, 1], coord[:, 2]] = True
+    node_coord = np.argwhere(node_grid).astype(np.int32)
 
     node_type_grid = get_node_type(voxel)
-    node_type = node_type_grid[all_node_coo[:, 0], all_node_coo[:, 1], all_node_coo[:, 2]]  # (Nn,8)
-
-    node_dof_full_grid = torch.zeros_like(voxel, dtype=torch.int32)
-    dof_index = torch.arange(all_node_coo.shape[0], dtype=torch.int32, device=device)
-    node_dof_full_grid[all_node_coo[:, 0], all_node_coo[:, 1], all_node_coo[:, 2]] = dof_index
-
-    node_index = torch.zeros((voxel_coo.shape[0], 8), dtype=torch.int32, device=device)
-    hex8 = torch.tensor(
-        [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]],
-        dtype=torch.int64,
-        device=device
+    node_type = node_type_grid[node_coord[:, 0], node_coord[:, 1], node_coord[:, 2]]
+    node_id_grid = np.zeros_like(voxel, dtype=np.int32)
+    node_id_grid[node_coord[:, 0], node_coord[:, 1], node_coord[:, 2]] = np.arange(
+        node_coord.shape[0], dtype=np.int32
     )
-    for i in range(8):
-        coo = (hex8[i] + voxel_coo + res) % res
-        node_index[:, i] = node_dof_full_grid[coo[:, 0], coo[:, 1], coo[:, 2]]
 
-    return (
-        all_node_coo.cpu().numpy().astype(np.int32),
-        node_type.cpu().numpy().astype(np.uint8),
-        voxel.cpu().numpy().astype(bool),
-        node_index.cpu().numpy().astype(np.int32),
-    )
+    node_index = np.zeros((voxel_coord.shape[0], 8), dtype=np.int32)
+    for corner, offset in enumerate(HEX8):
+        coord = (voxel_coord + offset) % res
+        node_index[:, corner] = node_id_grid[coord[:, 0], coord[:, 1], coord[:, 2]]
+    return node_coord, node_type, node_index, voxel
 
 
 def unique_path_if_exists(path: Path) -> Path:
     if not path.exists():
         return path
-    stem, suf = path.stem, path.suffix
-    i = 1
+    index = 1
     while True:
-        cand = path.with_name(f"{stem}_{i}{suf}")
-        if not cand.exists():
-            return cand
-        i += 1
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
-def folder_id(idx: int) -> str:
-    """
-    0->A, 1->B, ..., 25->Z, 26->AA, 27->AB ...
-    """
-    s = ""
-    idx += 1
-    while idx > 0:
-        idx, r = divmod(idx - 1, 26)
-        s = chr(ord("A") + r) + s
-    return s
+def folder_id(index: int) -> str:
+    result = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(ord("A") + remainder) + result
+    return result
 
 
 def main():
@@ -107,40 +83,33 @@ def main():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--res", type=int, default=64)
     parser.add_argument("--type", type=str, default="Truss")
-    parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--avoid_collision", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    processed, skipped = 0, 0
-
-    for dir_idx, in_dir in enumerate(args.input_dirs):
-        in_dir = Path(in_dir)
-        if not in_dir.exists():
-            print(f"[WARN] input dir not found: {in_dir}")
+    processed = skipped = 0
+    for dir_index, directory in enumerate(args.input_dirs):
+        directory = Path(directory)
+        if not directory.exists():
+            print(f"[WARN] input dir not found: {directory}")
             continue
-
-        dir_tag = folder_id(dir_idx)  # A/B/C...
-
-        files = [p for p in in_dir.iterdir() if p.is_file() and p.suffix.lower() in (".npy", ".csv", ".npz")]
-        for path in tqdm(files, desc=f"Processing {in_dir.name} ({dir_tag})", leave=False):
- 
-            out_path = out_dir / f"{args.type}_{dir_tag}_{path.stem}.npz"
-
-            if out_path.exists() and (not args.overwrite) and (not args.avoid_collision):
+        files = [
+            path for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in {".npy", ".csv", ".npz"}
+        ]
+        for path in tqdm(files, desc=f"Processing {directory.name}", leave=False):
+            out_path = out_dir / f"{args.type}_{folder_id(dir_index)}_{path.stem}.npz"
+            if out_path.exists() and not args.overwrite and not args.avoid_collision:
                 skipped += 1
                 continue
-            if args.avoid_collision and (not args.overwrite):
+            if args.avoid_collision and not args.overwrite:
                 out_path = unique_path_if_exists(out_path)
-
             try:
-                voxel_np = load_voxel_from_file(path, args.res)
-                coords, node_type, voxel, node_index = process_one_voxel(voxel_np, args.res, device)
-
+                coords, node_type, node_index, voxel = process_one_voxel(
+                    load_voxel_from_file(path, args.res), args.res
+                )
                 np.savez(
                     out_path,
                     coords=coords,
@@ -149,9 +118,8 @@ def main():
                     node_index=node_index,
                 )
                 processed += 1
-            except Exception as e:
-                print(f"[ERROR] failed on {path}: {e}")
-
+            except Exception as error:
+                print(f"[ERROR] failed on {path}: {error}")
     print(f"Done. Processed={processed}, Skipped={skipped}, Out={out_dir}")
 
 

@@ -1,305 +1,252 @@
-import os
+"""Training utilities for the pure-Jittor GMT implementation.
+
+The filename is kept for import compatibility with earlier scripts.
+"""
+
 import math
-import torch
-import lightning as pl
+import os
 
-from train._utils import (
-    hexahedron,
-    assembly,
-    assemble_F_fast,
-    isotropic_elastic_tensor,
-    PCG,
-)
-from train.dataset import sparse_collate, SparseDataset
-from train.minimal_potential_energy_loss import MPE_loss, MPE_loss_func
+import jittor as jt
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+
+from train._utils import assemble_F_fast, hexahedron, isotropic_elastic_tensor
+from train.dataset import SparseDataset, iter_sparse_batches
 from train.model import GMT
-from train.eval import *
-import torch.optim as optim
-from torch.utils.data import DataLoader
 
 
-
-class CosineAnnealingWarmupRestarts(optim.lr_scheduler._LRScheduler):
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        first_cycle_steps: int,
-        cycle_mult: float = 1.0,
-        max_lr: float = 0.1,
-        min_lr: float = 0.001,
-        warmup_steps: int = 0,
-        gamma: float = 1.0,
-        last_epoch: int = -1,
-    ):
-        assert warmup_steps < first_cycle_steps
-        self.first_cycle_steps = first_cycle_steps
-        self.cycle_mult = cycle_mult
-        self.base_max_lr = max_lr
-        self.max_lr = max_lr
-        self.min_lr = min_lr
-        self.warmup_steps = warmup_steps
-        self.gamma = gamma
-        self.cur_cycle_steps = first_cycle_steps
-        self.cycle = 0
-        self.step_in_cycle = last_epoch
-        super().__init__(optimizer, last_epoch)
-        self.init_lr()
-
-    def init_lr(self):
-        self.base_lrs = []
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = self.min_lr
-            self.base_lrs.append(self.min_lr)
-
-    def get_lr(self):
-        if self.step_in_cycle == -1:
-            return self.base_lrs
-        elif self.step_in_cycle < self.warmup_steps:
-            return [
-                (self.max_lr - base_lr) * self.step_in_cycle / self.warmup_steps + base_lr
-                for base_lr in self.base_lrs
-            ]
-        else:
-            return [
-                base_lr
-                + (self.max_lr - base_lr)
-                * (
-                    1
-                    + math.cos(
-                        math.pi
-                        * (self.step_in_cycle - self.warmup_steps)
-                        / (self.cur_cycle_steps - self.warmup_steps)
-                    )
-                )
-                / 2
-                for base_lr in self.base_lrs
-            ]
-
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-            self.step_in_cycle += 1
-            if self.step_in_cycle >= self.cur_cycle_steps:
-                self.cycle += 1
-                self.step_in_cycle -= self.cur_cycle_steps
-                self.cur_cycle_steps = int((self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult) + self.warmup_steps
-        else:
-            if epoch >= self.first_cycle_steps:
-                if self.cycle_mult == 1.0:
-                    self.step_in_cycle = epoch % self.first_cycle_steps
-                    self.cycle = epoch // self.first_cycle_steps
-                else:
-                    n = int(math.log((epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1), self.cycle_mult))
-                    self.cycle = n
-                    self.step_in_cycle = epoch - int(self.first_cycle_steps * (self.cycle_mult**n - 1) / (self.cycle_mult - 1))
-                    self.cur_cycle_steps = self.first_cycle_steps * (self.cycle_mult**n)
-            else:
-                self.cur_cycle_steps = self.first_cycle_steps
-                self.step_in_cycle = epoch
-
-        self.max_lr = self.base_max_lr * (self.gamma**self.cycle)
-        self.last_epoch = math.floor(epoch)
-        for pg, lr in zip(self.optimizer.param_groups, self.get_lr()):
-            pg["lr"] = lr
+def residual_loss(residual: jt.Var, coord: jt.Var, batch_size: int, logarithmic=True):
+    # Match the original PyTorch trainer: accumulate residual norms in float64.
+    # Squaring a large float32 residual can overflow before gradient clipping runs.
+    total = jt.array(0.0).float64()
+    batch_ids = coord[:, 0]
+    for batch_id in range(batch_size):
+        selected = residual[batch_ids == batch_id].float64()
+        norm = jt.sqrt((selected * selected).sum(dim=0).sum(dim=0) + 1e-30)
+        if logarithmic:
+            norm = jt.log(norm) / math.log(10.0)
+        total = total + norm.mean()
+    return total / batch_size
 
 
-class ExponentialMovingAverage:
-    def __init__(self, parameters, decay, use_num_updates=True):
-        if not (0.0 <= decay <= 1.0):
-            raise ValueError("Decay must be between 0 and 1")
-        self.decay = decay
-        self.num_updates = 0 if use_num_updates else None
-        self.shadow_params = [p.detach().clone() for p in parameters if p.requires_grad]
-        self.collected_params = None
-
-    def to(self, device=None, dtype=None):
-        for i in range(len(self.shadow_params)):
-            self.shadow_params[i] = self.shadow_params[i].to(device=device, dtype=(dtype or self.shadow_params[i].dtype))
-        return self
-
-    def update(self, parameters):
-        decay = self.decay
-        if self.num_updates is not None:
-            self.num_updates += 1
-            decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
-        one_minus_decay = 1.0 - decay
-
-        with torch.no_grad():
-            params = [p for p in parameters if p.requires_grad]
-            for i, (s, p) in enumerate(zip(self.shadow_params, params)):
-                if s.device != p.device or s.dtype != p.dtype:
-                    self.shadow_params[i] = s.to(device=p.device, dtype=p.dtype)
-                    s = self.shadow_params[i]
-                s.sub_(one_minus_decay * (s - p))
-
-    def store(self, parameters):
-        params = [p for p in parameters if p.requires_grad]
-        with torch.no_grad():
-            self.collected_params = [p.detach().clone() for p in params]
-
-    def copy_to(self, parameters):
-        params = [p for p in parameters if p.requires_grad]
-        with torch.no_grad():
-            for s, p in zip(self.shadow_params, params):
-                p.data.copy_(s.data)
-
-    def restore(self, parameters):
-        if self.collected_params is None:
-            return
-        params = [p for p in parameters if p.requires_grad]
-        with torch.no_grad():
-            for c, p in zip(self.collected_params, params):
-                p.data.copy_(c.data)
-
-
-class SparseDataModule(pl.LightningDataModule):
-    def __init__(self, train_data_path, val_data_path, batch_size=8, num_workers=1):
-        super().__init__()
-        self.train_data_path = train_data_path
-        self.val_data_path = val_data_path
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-
-    def setup(self, stage=None):
-        self.train_ds = SparseDataset(self.train_data_path)
-        self.val_ds = SparseDataset(self.val_data_path)
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_ds,
-            batch_size=self.batch_size,
-            drop_last=True,
-            shuffle=True,
-            num_workers=self.num_workers,
-            collate_fn=sparse_collate,
-            pin_memory=True,
-            persistent_workers=(self.num_workers > 0),
-            prefetch_factor=4 if self.num_workers > 0 else None,
+def _assert_finite_tensor(name: str, value: jt.Var):
+    if not bool(value.isfinite().all().item()):
+        raise FloatingPointError(
+            f"Non-finite values first detected in {name}. "
+            "The optimizer update was not applied."
         )
 
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_ds,
-            batch_size=self.batch_size,
-            drop_last=True,
+
+def _named_optimizer_gradients(model, optimizer):
+    names = {id(param): name for name, param in model.named_parameters()}
+    for group_id, group in enumerate(optimizer.param_groups):
+        for param_id, (param, grad) in enumerate(
+            zip(group["params"], group.get("grads", []))
+        ):
+            if param.is_stop_grad():
+                continue
+            name = names.get(id(param), f"param_group_{group_id}.{param_id}")
+            yield name, grad
+
+
+def _assert_finite_gradients(model, optimizer):
+    named_grads = list(_named_optimizer_gradients(model, optimizer))
+    if not named_grads:
+        return
+    checks = jt.concat(
+        [grad.isfinite().all().reshape(1) for _, grad in named_grads], dim=0
+    )
+    if bool(checks.all().item()):
+        return
+    for name, grad in named_grads:
+        if not bool(grad.isfinite().all().item()):
+            raise FloatingPointError(
+                f"Non-finite gradient first detected in parameter '{name}'. "
+                "The optimizer update was not applied."
+            )
+
+
+def _assert_finite_parameters(model):
+    named_parameters = model.named_parameters()
+    checks = jt.concat(
+        [param.isfinite().all().reshape(1) for _, param in named_parameters], dim=0
+    )
+    if bool(checks.all().item()):
+        return
+    for name, param in named_parameters:
+        if not bool(param.isfinite().all().item()):
+            raise FloatingPointError(
+                f"Non-finite parameter first detected in '{name}' after optimizer.step()."
+            )
+
+
+def _clip_grad_norm_float64(model, optimizer, max_norm: float) -> float:
+    """Clip gradients without overflowing Jittor's float32 global norm."""
+    named_grads = list(_named_optimizer_gradients(model, optimizer))
+    total_squared = jt.array(0.0).float64()
+    for _, grad in named_grads:
+        grad64 = grad.float64()
+        total_squared = total_squared + (grad64 * grad64).sum()
+    total_norm = jt.sqrt(total_squared)
+    coefficient = jt.minimum(
+        jt.array(float(max_norm)).float64() / (total_norm + 1e-12),
+        jt.array(1.0).float64(),
+    ).float32()
+    for _, grad in named_grads:
+        grad.update(grad * coefficient)
+    return float(total_norm.item())
+
+
+def _set_lr(optimizer, lr: float):
+    optimizer.lr = lr
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def cosine_lr(base_lr: float, epoch: int, max_epoch: int) -> float:
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * epoch / max(1, max_epoch)))
+
+
+def validate(model, dataset, cfg, Ke, Fe):
+    model.eval()
+    total = 0.0
+    count = 0
+    with jt.no_grad():
+        for batch in iter_sparse_batches(
+            dataset,
+            int(cfg.batch_size),
             shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=sparse_collate,
-            pin_memory=True,
-            persistent_workers=(self.num_workers > 0),
-            prefetch_factor=4 if self.num_workers > 0 else None,
+            rank=jt.rank,
+            world_size=jt.world_size,
+        ):
+            F = assemble_F_fast(batch["node_index"], Fe, batch["feature"].shape[0])
+            _, residual = model(batch, Ke, F)
+            loss = residual_loss(residual, batch["coord"], int(cfg.batch_size), False)
+            total += float(loss.item())
+            count += 1
+    stats = jt.array([total, float(count)]).float64()
+    if jt.in_mpi:
+        stats = stats.mpi_all_reduce()
+    model.train()
+    return float(stats[0].item()) / max(1.0, float(stats[1].item()))
+
+
+def train(cfg):
+    use_cuda = str(cfg.device).lower() in {"gpu", "cuda", "cuda:0"} and jt.has_cuda
+    jt.flags.use_cuda = int(use_cuda)
+    jt.set_global_seed(0)
+    visible_devices = [
+        device
+        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+    if use_cuda and not jt.in_mpi and len(visible_devices) > 1:
+        print(
+            "WARNING: multiple GPUs are visible, but only one Python process was "
+            "started. Use mpirun -np <gpu_count> for Jittor data parallel training."
+        )
+    local_world_size = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", "1"))
+    if (
+        use_cuda
+        and jt.in_mpi
+        and visible_devices
+        and local_world_size > len(visible_devices)
+    ):
+        raise RuntimeError(
+            f"MPI started {local_world_size} local processes, but only "
+            f"{len(visible_devices)} CUDA devices are visible."
         )
 
-
-class LightningModule(pl.LightningModule):
-
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.model = GMT(cfg)
-
-        self.lr = cfg.learning_rate
-        self.batch_size = cfg.batch_size
-        self.resolution = cfg.resolution
-
-        self.C = isotropic_elastic_tensor(1.0, 0.3)
-        Ke, Fe, X0 = hexahedron(r=self.resolution, C=self.C)
-        self.register_buffer("Ke", Ke)
-        self.register_buffer("Fe", Fe)
-        self.register_buffer("X0", X0)
-
-        self.ema = ExponentialMovingAverage(self.model.parameters(), decay=0.999)
-        self._last_lr = None
-
-    def on_fit_start(self):
-        p = next(self.model.parameters())
-        self.ema.to(device=p.device, dtype=p.dtype)
-
-    # ---- EMA only for validation ----
-    def on_validation_epoch_start(self):
-        self.ema.store(self.model.parameters())
-        self.ema.copy_to(self.model.parameters())
-
-    def on_validation_epoch_end(self):
-        self.ema.restore(self.model.parameters())
-
-    def training_step(self, batch, batch_idx):
-        n_nodes = batch["feature"].shape[0]
-        F = assemble_F_fast(batch["node_index"], self.Fe, n_nodes)
-
-        u, r = self.model(batch, self.Ke, F, self.batch_size)
-        r64 = r.double()
-        r64 = r64.view(-1, 3, 6)
-
-        
-        loss = torch.log10(torch.linalg.norm(r64))
-
-        loss = 0.0
-        eq_log_sum = r64.new_zeros((6,))  
-
-        for i in range(self.batch_size):
-            mask = (batch["coord"][:, 0] == i)
-
-            eq_norm = torch.linalg.norm(r64[mask], dim=(0, 1))  # (6,)
-            eq_log = eq_norm
-            eq_log = torch.log10(eq_norm + 1e-30)                      # (6,)
-
-            loss = loss + eq_log.mean()
-            eq_log_sum = eq_log_sum + eq_log
-
-        loss = loss / self.batch_size
-
-        eq_log_mean = eq_log_sum / self.batch_size
-
-        self.log("train_r", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=False, batch_size=self.batch_size)
-
-        opt = self.optimizers()
-        lr = opt.param_groups[0]["lr"]
-        self.log("lr", lr, prog_bar=True, on_step=True, on_epoch=False, sync_dist=False , batch_size=self.batch_size)
-
-        return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        self.ema.update(self.model.parameters())
-
-    def validation_step(self, batch, batch_idx):
-        n_nodes = batch["feature"].shape[0]
-        F = assemble_F_fast(batch["node_index"], self.Fe, n_nodes)
-        u, r = self.model(batch, self.Ke, F, self.batch_size)
-
-        r64 = r.double()
-        r64 = r64.view(-1, 3, 6)
-
-    
-        loss = 0.0
-
-        for i in range(self.batch_size):
-            mask = (batch["coord"][:, 0] == i)
-
-            eq_norm = torch.linalg.norm(r64[mask], dim=(0, 1))  # (6,)
-            # eq_log = eq_norm
-
-            loss = loss + eq_norm.mean()
-
-
-
-
-        self.log("val_r", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=False, batch_size=self.batch_size)
-
-
-        opt = self.optimizers()
-        lr = opt.param_groups[0]["lr"]
-        self.log("lr", lr, prog_bar=True, on_step=True, on_epoch=False, sync_dist=False , batch_size=self.batch_size)
-
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=0.01)
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10
+    train_ds = SparseDataset(cfg.train_data_path)
+    val_paths = getattr(cfg, "val_data_path", getattr(cfg, "vail_data_path", []))
+    val_ds = SparseDataset(val_paths)
+    if len(train_ds) == 0:
+        raise RuntimeError(
+            "No training .npz files were found. Update train_data_path in the config."
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler
-            }
-        
+
+    model = GMT(cfg)
+    if cfg.pre_train:
+        model.load_state_dict(jt.load(str(cfg.pre_train)))
+
+    optimizer = jt.optim.AdamW(
+        model.parameters(), lr=float(cfg.learning_rate), weight_decay=0.01
+    )
+    C = isotropic_elastic_tensor(1.0, 0.3)
+    Ke, Fe = hexahedron(int(cfg.resolution), C)
+
+    log_dir = os.path.join(cfg.output_path, cfg.logger.path, cfg.logger.version)
+    checkpoint_dir = os.path.join(cfg.output_path, cfg.checkpoint.path)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    is_main_process = jt.rank == 0
+    writer = SummaryWriter(log_dir) if is_main_process else None
+    if is_main_process:
+        print(
+            f"Jittor distributed={jt.in_mpi} world_size={jt.world_size} "
+            f"per_gpu_batch_size={cfg.batch_size} "
+            f"global_batch_size={int(cfg.batch_size) * jt.world_size}"
+        )
+
+    best_val = float("inf")
+    global_step = 0
+    base_lr = float(cfg.learning_rate)
+    warmup_steps = max(0, int(getattr(cfg, "warmup_steps", 0)))
+    gradient_clip_norm = float(getattr(cfg, "gradient_clip_norm", 1.0))
+    for epoch in range(int(cfg.max_epoch)):
+        model.train()
+        epoch_lr = cosine_lr(base_lr, epoch, int(cfg.max_epoch))
+        progress = tqdm(
+            iter_sparse_batches(
+                train_ds,
+                int(cfg.batch_size),
+                shuffle=True,
+                rank=jt.rank,
+                world_size=jt.world_size,
+                seed=epoch,
+            ),
+            desc=f"Epoch {epoch + 1}/{cfg.max_epoch}",
+            total=len(train_ds) // (int(cfg.batch_size) * jt.world_size),
+            disable=not is_main_process,
+        )
+        for batch in progress:
+            warmup_scale = (
+                min(1.0, float(global_step + 1) / warmup_steps)
+                if warmup_steps
+                else 1.0
+            )
+            lr = epoch_lr * warmup_scale
+            _set_lr(optimizer, lr)
+            F = assemble_F_fast(batch["node_index"], Fe, batch["feature"].shape[0])
+            _, residual = model(batch, Ke, F)
+            _assert_finite_tensor("model residual before loss", residual)
+            loss = residual_loss(residual, batch["coord"], int(cfg.batch_size), True)
+            _assert_finite_tensor("training loss before backward", loss)
+            optimizer.zero_grad()
+            optimizer.backward(loss)
+            _assert_finite_gradients(model, optimizer)
+            grad_norm = _clip_grad_norm_float64(model, optimizer, gradient_clip_norm)
+            optimizer.step()
+            if global_step < 10:
+                _assert_finite_parameters(model)
+            value = float(loss.item())
+            if writer:
+                writer.add_scalar("train/residual_log10", value, global_step)
+                writer.add_scalar("train/lr", lr, global_step)
+                writer.add_scalar("train/gradient_norm", grad_norm, global_step)
+            progress.set_postfix(loss=f"{value:.5f}", grad=f"{grad_norm:.3e}")
+            global_step += 1
+
+        val_loss = validate(model, val_ds, cfg, Ke, Fe) if len(val_ds) else float("nan")
+        if writer:
+            writer.add_scalar("validation/residual", val_loss, epoch)
+        if is_main_process:
+            jt.save(model.state_dict(), os.path.join(checkpoint_dir, "last.pkl"))
+            if val_loss < best_val:
+                best_val = val_loss
+                jt.save(model.state_dict(), os.path.join(checkpoint_dir, "best.pkl"))
+            print(f"epoch={epoch + 1} val_residual={val_loss:.6e}")
+
+    if writer:
+        writer.close()
+    return model

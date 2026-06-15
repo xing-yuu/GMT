@@ -10,10 +10,12 @@ Official implementation of **GMT: A Geometric Multigrid Transformer Solver for M
 
 GMT is a neural solver for large-scale microstructure homogenization. It combines sparse 3D feature extraction, Point Transformer V3 blocks, and a geometric multigrid solver to accelerate the linear elasticity solves that dominate high-resolution homogenization pipelines.
 
-This repository currently provides:
+This repository provides a pure-Jittor implementation:
 
-- Training code based on PyTorch Lightning
+- Training and automatic differentiation based on Jittor
 - Sparse voxel preprocessing utilities
+- Serialized sparse point attention without spconv or flash-attn
+- Matrix-free element-by-element geometric multigrid correction
 - The default experiment configuration used by the release
 - Checkpoint and TensorBoard logging support
 
@@ -30,28 +32,35 @@ This repository currently provides:
     |-- model.py                # GMT model
     |-- EBE_GMG.py              # Element-by-element geometric multigrid solver
     |-- PTv3_3.py               # Point Transformer V3 backbone
-    |-- sp_lightning.py         # Lightning module and data module
+    |-- sp_lightning.py         # Jittor training loop (legacy filename)
     `-- _utils.py               # FEM assembly and solver utilities
 ```
 
 ## Environment
 
-The released environment is captured in `environment.yml`.
+The Jittor environment is captured in `environment.yml`.
+See the [Jittor homepage](https://cg.cs.tsinghua.edu.cn/jittor/) and
+[Jittor API documentation](https://cg.cs.tsinghua.edu.cn/jittor/assets/docs/index.html).
 
 Requirements:
 
-- Linux is recommended
-- NVIDIA GPU with CUDA support
+- Linux with an NVIDIA GPU is recommended
 - Conda or Mamba
 
 Create and activate the environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate GMT
+conda activate GMT-jittor
 ```
 
-The environment includes CUDA-enabled PyTorch, Lightning, spconv, flash-attn, and Point Transformer related sparse operators. If your local CUDA driver or GPU architecture differs from the release machine, you may need to rebuild the sparse CUDA extensions for your system.
+Jittor compiles operators for the current machine on first use. The migrated code
+does not depend on PyTorch, Lightning, spconv, flash-attn, or torch-scatter.
+
+The Jittor sparse point backbone is API-equivalent at the training boundary, but
+its operator implementation differs from the original spconv/flash-attn model.
+Existing PyTorch checkpoints are therefore not compatible and the model must be
+retrained.
 
 ## Data Format
 
@@ -73,7 +82,7 @@ data/Vail/Truss
 data/Vail/TPMS
 ```
 
-Update `train_data_path` and `vail_data_path` in `configs/train.yaml` to match your local dataset paths. The default release config uses `resolution: 64`. -->
+Update `train_data_path` and `val_data_path` in `configs/train.yaml` to match your local dataset paths. The default release config uses `resolution: 64`. -->
 
 ## Preprocessing Voxels
 
@@ -92,8 +101,7 @@ python datagen/generate.py \
   --input_dirs path/to/raw_voxels \
   --out_dir data/Train/Truss \
   --res 64 \
-  --type Truss \
-  --device cuda:0
+  --type Truss
 ```
 
 The script treats positive values as solid voxels and writes one processed `.npz` file per input sample.
@@ -102,8 +110,9 @@ The script treats positive values as solid voxels and writes one processed `.npz
 
 Edit `configs/train.yaml` before training. The most commonly changed fields are:
 
-- `train_data_path`, `vail_data_path`: processed training and validation folders
-- `batch_size`, `num_works`: dataloader settings
+- `train_data_path`, `val_data_path`: processed training and validation folders
+- `batch_size`: sparse batch size
+- `learning_rate`, `warmup_steps`, `gradient_clip_norm`: optimizer stability settings
 - `resolution`: voxel resolution
 - `model.*`: transformer depth, channels, heads, and window sizes
 - `GMG.*`: geometric multigrid smoothing and cycle settings
@@ -115,13 +124,19 @@ Run on one visible GPU:
 CUDA_VISIBLE_DEVICES=0 python main.py configs/train.yaml
 ```
 
-Run with multiple visible GPUs:
+Run with Jittor MPI:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py configs/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2 mpirun --bind-to none -np 3 \
+  python main.py configs/train.yaml
 ```
 
-`main.py` uses PyTorch Lightning DDP. The number of visible GPUs is controlled by `CUDA_VISIBLE_DEVICES`.
+`batch_size` is the per-GPU batch size. With three MPI processes and
+`batch_size: 3`, the effective global batch size is 9. Jittor assigns one MPI
+process to each visible GPU and averages gradients through MPI/NCCL.
+
+Set `device: cpu` in the YAML config for CPU execution. Jittor uses CUDA when
+`device: gpu` and a supported CUDA installation are available.
 
 ## Outputs
 
@@ -129,7 +144,7 @@ Outputs are written under `output_path` in the config. With the default config:
 
 ```text
 result/
-|-- checkpoint/     # Lightning checkpoints
+|-- checkpoint/     # Jittor model state dictionaries
 `-- tf_logs/        # TensorBoard logs
 ```
 
@@ -137,6 +152,13 @@ Launch TensorBoard with:
 
 ```bash
 tensorboard --logdir result/tf_logs
+```
+
+Run the one-step model smoke test in a Linux Jittor environment:
+
+```bash
+PYTHONPATH=. python tests/smoke_test.py
+CUDA_VISIBLE_DEVICES=0 JITTOR_USE_CUDA=1 PYTHONPATH=. python tests/smoke_test.py
 ```
 <!-- 
 ## Current Release Notes
